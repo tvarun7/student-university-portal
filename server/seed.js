@@ -211,7 +211,7 @@ const CSE_4_1_EXAMS = [
 
 // ─── MAIN SEED ────────────────────────────────────────────────────────────────
 export async function seed() {
-  if (process.env.NODE_ENV === 'production')
+  if (process.env.NODE_ENV === 'production' && process.env.AUTO_SEED !== 'true')
     throw new Error('Seeding is disabled in production.');
 
   await initDb();
