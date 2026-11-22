@@ -1,0 +1,187 @@
+import 'dotenv/config';
+import express from 'express';
+import session from 'express-session';
+import connectPg from 'connect-pg-simple';
+import helmet from 'helmet';
+import {rateLimit} from 'express-rate-limit';
+import {randomUUID,randomBytes} from 'node:crypto';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {installUpgrade,userFields,visibleCourses,academicWrite,components,markValues,membership,scopeSql,attendanceInput,saveAttendance,timetable,campusContext} from './upgrade.js';
+import {transaction} from './db.js';
+import {db,pool} from './db.js';
+import {hashPassword,verifyPassword,strongPassword,csrf} from './security.js';
+const production=process.env.NODE_ENV==='production';
+if(production&&(!process.env.SESSION_SECRET||process.env.SESSION_SECRET.length<32||process.env.SESSION_SECRET.startsWith('replace-')))throw new Error('Set a unique strong SESSION_SECRET before production');
+const app=express();
+if(process.env.TRUST_PROXY==='1')app.set('trust proxy',1);
+app.disable('x-powered-by');
+app.use(helmet({contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'"],styleSrc:["'self'","'unsafe-inline'"],imgSrc:["'self'",'data:'],connectSrc:["'self'"],fontSrc:["'self'"],objectSrc:["'none'"],frameAncestors:["'none'"]}},strictTransportSecurity:production?undefined:false}));
+app.use(express.json({limit:'512kb'}));
+app.use(session({name:'su.sid',secret:process.env.SESSION_SECRET||randomBytes(48).toString('hex'),resave:false,saveUninitialized:false,store:pool?new(connectPg(session))({pool,createTableIfMissing:true}):undefined,cookie:{httpOnly:true,secure:production,sameSite:'lax',maxAge:2*60*60*1000}}));
+const api=express.Router();app.use('/api',api);
+api.use((req,res,next)=>{res.set('Cache-Control','no-store');next();});
+api.use(rateLimit({windowMs:60000,limit:300,standardHeaders:'draft-8',legacyHeaders:false}));
+api.use((req,res,next)=>{if(!['GET','HEAD','OPTIONS'].includes(req.method)&&(!req.session.csrf||req.get('X-CSRF-Token')!==req.session.csrf))return res.status(403).json({error:'Invalid CSRF token. Refresh the page.'});next();});
+const fail=(status,message)=>{const e=new Error(message);e.status=status;throw e;};
+const rows=async(sql,args=[])=>(await db.query(sql,args)).rows;
+const one=async(sql,args=[])=>(await rows(sql,args))[0];
+const fields=userFields;
+const text=(v,label,max=200)=>{if(typeof v!=='string'||!v.trim()||v.trim().length>max)fail(400,`Invalid ${label}`);return v.trim();};
+const id=(v)=>text(v,'ID',80);
+const date=(v)=>{if(typeof v!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(v)||Number.isNaN(Date.parse(v))||new Date(v).toISOString().slice(0,10)!==v)fail(400,'Invalid date');return v;};
+const logged=async(req,res,next)=>{if(!req.session.uid)return res.status(401).json({error:'Please sign in'});req.user=await one(`SELECT ${fields} FROM users WHERE id=$1 AND active=true`,[req.session.uid]);const version=await one('SELECT session_version FROM users WHERE id=$1',[req.session.uid]);if(req.user&&(req.session.version??0)!==version?.session_version)req.user=null;if(!req.user)return res.status(401).json({error:'Account unavailable'});next();};
+const roles=(...allowed)=>(req,res,next)=>allowed.includes(req.user.role)?next():res.status(403).json({error:'Your role cannot perform this action'});
+const audit=(req,action,target)=>db.query('INSERT INTO audit_log(id,actor_id,action,target) VALUES($1,$2,$3,$4)',[randomUUID(),req.user.id,action,target]);
+const sessionShape=async(req)=>{let user=null;if(req.session.uid){const version=await one('SELECT session_version FROM users WHERE id=$1',[req.session.uid]);if((req.session.version??0)===version?.session_version)user=await one(`SELECT ${fields} FROM users WHERE id=$1 AND active=true`,[req.session.uid])||null;}return {user,csrfToken:req.session.csrf};};
+api.get('/health',async(req,res)=>{await db.query('SELECT 1');res.json({ok:true});});
+api.get('/auth/session',async(req,res)=>{req.session.csrf||=csrf();res.json(await sessionShape(req));});
+const dummy=await hashPassword(randomBytes(32).toString('hex'));
+api.post('/auth/login',rateLimit({windowMs:15*60000,limit:20,standardHeaders:'draft-8',legacyHeaders:false}),async(req,res)=>{
+ const username=text(req.body.username,'username',80),password=req.body.password,role=text(req.body.role,'role',20);
+ if(typeof password!=='string'||password.length<1||password.length>128)fail(400,'Invalid password');
+ const u=await one('SELECT * FROM users WHERE username=$1',[username]);
+ const valid=await verifyPassword(password,u?.password_hash||dummy);
+ if(!u||!valid||!u.active||u.role!==role)fail(401,'Incorrect credentials or role');
+ await new Promise((resolve,reject)=>req.session.regenerate(e=>e?reject(e):resolve()));req.session.uid=u.id;req.session.version=u.session_version;req.session.csrf=csrf();res.json(await sessionShape(req));
+});
+api.post('/auth/logout',(req,res)=>req.session.destroy(e=>{if(e)return res.status(500).json({error:'Could not sign out'});res.clearCookie('su.sid');res.json({ok:true});}));
+api.get('/notices',async(req,res)=>res.json(await rows('SELECT * FROM notices ORDER BY date DESC')));
+api.use(logged);
+installUpgrade(api,{roles,audit});
+api.post('/auth/password',async(req,res)=>{const {currentPassword,newPassword}=req.body;if(typeof currentPassword!=='string'||!strongPassword(newPassword))fail(400,'New password must be 12–128 characters');const u=await one('SELECT password_hash FROM users WHERE id=$1',[req.user.id]);if(!await verifyPassword(currentPassword,u.password_hash))fail(400,'Current password incorrect');await db.query('UPDATE users SET password_hash=$1 WHERE id=$2',[await hashPassword(newPassword),req.user.id]);await audit(req,'password_changed',req.user.id);await new Promise((resolve,reject)=>req.session.regenerate(e=>e?reject(e):resolve()));res.json({ok:true});});
+api.get('/courses',async(req,res)=>res.json(await visibleCourses(req.user)));
+api.get('/students',roles('admin','staff'),async(req,res)=>res.json(req.user.role==='admin'?await rows("SELECT "+fields+" FROM users WHERE role='student' AND active=true ORDER BY name"):await rows("SELECT DISTINCT u.id,u.username,u.name,u.department,u.semester,u.batch_id,b.name AS batch_name,b.department_id FROM users u JOIN enrollments e ON u.id=e.student_id JOIN courses c ON c.id=e.course_id LEFT JOIN batches b ON b.id=u.batch_id WHERE "+scopeSql()+" AND u.active=true ORDER BY u.name",[req.user.id])));
+api.get('/users',roles('admin'),async(req,res)=>res.json(await rows(`SELECT ${fields} FROM users ORDER BY role,name`)));
+async function childLink(child){if(child===null||child===undefined||child==='')return null;const u=await one("SELECT id FROM users WHERE id=$1 AND role='student' AND active=true",[id(child)]);if(!u)fail(400,'Linked child must be an active student');return u.id;}
+api.post('/users',roles('admin'),async(req,res)=>{const b=req.body;if(!['staff','student','parent'].includes(b.role))fail(400,'Invalid role');const username=text(b.username,'username',80);if(!/^[a-zA-Z0-9_.@-]+$/.test(username))fail(400,'Invalid username');if(!strongPassword(b.password))fail(400,'Password must be 12–128 characters');if(b.batch_id!==undefined&&b.batch_id!==null&&typeof b.batch_id!=='string')fail(400,'Invalid batch');const batch=b.batch_id?await membership(b.batch_id):null;if(batch&&b.role!=='student')fail(400,'Only students may join a batch');const uid=randomUUID();await db.query('INSERT INTO users(id,username,name,role,password_hash,department,semester,child_id,batch_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',[uid,username,text(b.name,'name'),b.role,await hashPassword(b.password),batch?.department||(typeof b.department==='string'?b.department.slice(0,100):''),batch?.semester||(typeof b.semester==='string'?b.semester.slice(0,30):''),b.role==='parent'?await childLink(b.child_id):null,batch?.id||null]);await audit(req,'user_created',uid);res.status(201).json(await one(`SELECT ${fields} FROM users WHERE id=$1`,[uid]));});
+api.put('/users/:id',roles('admin'),async(req,res)=>{const u=await one('SELECT * FROM users WHERE id=$1',[id(req.params.id)]);if(!u||u.role==='admin')fail(400,'Only staff, student, and parent entries can be edited');const b=req.body;if(b.role!==undefined&&b.role!==u.role)fail(400,'Role cannot be changed');if(b.batch_id!==undefined&&b.batch_id!==null&&typeof b.batch_id!=='string')fail(400,'Invalid batch');const batchId=b.batch_id===undefined?u.batch_id:b.batch_id;const batch=batchId?await membership(batchId):null;if(batch&&u.role!=='student')fail(400,'Only students may join a batch');if(b.active!==undefined&&typeof b.active!=='boolean')fail(400,'Active must be boolean');await db.query('UPDATE users SET name=$1,department=$2,semester=$3,child_id=$4,active=$5,batch_id=$7 WHERE id=$6',[b.name===undefined?u.name:text(b.name,'name'),batch?.department||(b.department===undefined?u.department:text(b.department||'—','department',100)),batch?.semester||(b.semester===undefined?u.semester:text(b.semester||'—','semester',30)),u.role==='parent'&&b.child_id!==undefined?await childLink(b.child_id):u.child_id,b.active??u.active,u.id,batch?.id||null]);await audit(req,'user_updated',u.id);res.json(await one(`SELECT ${fields} FROM users WHERE id=$1`,[u.id]));});
+api.delete('/users/:id',roles('admin'),async(req,res)=>{const u=await one('SELECT role FROM users WHERE id=$1',[id(req.params.id)]);if(!u||u.role==='admin')fail(400,'Cannot deactivate this account');await db.query('UPDATE users SET active=false WHERE id=$1',[req.params.id]);await audit(req,'user_deactivated',req.params.id);res.json({ok:true});});
+async function validStaff(staffId){if(!await one("SELECT id FROM users WHERE id=$1 AND role='staff' AND active=true",[id(staffId)]))fail(400,'Select an active staff member');}
+api.post('/courses',roles('admin'),async(req,res)=>{const b=req.body;if(b.staff_id)await validStaff(b.staff_id);const parts=components(b.components),cid=randomUUID();await db.query('INSERT INTO courses(id,code,name,staff_id,semester,components) VALUES($1,$2,$3,$4,$5,$6)',[cid,text(b.code,'code',50),text(b.name,'course name'),b.staff_id||null,text(b.semester,'semester',30),JSON.stringify(parts)]);await audit(req,'course_created',cid);res.status(201).json({id:cid});});
+api.put('/courses/:id',roles('admin'),async(req,res)=>{const b=req.body;if(b.staff_id)await validStaff(b.staff_id);await transaction(async tx=>{const c=(await tx.query('SELECT * FROM courses WHERE id=$1 FOR UPDATE',[id(req.params.id)])).rows[0];if(!c)fail(404,'Course not found');const parts=b.components===undefined?c.components:components(b.components);const marks=(await tx.query('SELECT values_json FROM marks WHERE course_id=$1',[c.id])).rows;for(const old of c.components){const next=parts.find(p=>p.key===old.key);for(const m of marks){const v=m.values_json[old.key];if(v!==null&&v!==undefined&&(!next||v>next.max))fail(400,'Cannot remove a recorded criterion or lower maximum below recorded marks');}}await tx.query('UPDATE courses SET name=$1,staff_id=$2,semester=$3,components=$4 WHERE id=$5',[b.name===undefined?c.name:text(b.name,'course name'),b.staff_id===undefined?c.staff_id:b.staff_id||null,b.semester===undefined?c.semester:text(b.semester,'semester',30),JSON.stringify(parts),c.id]);});await audit(req,'course_updated',req.params.id);res.json({ok:true});});
+api.post('/enrollments',roles('admin'),async(req,res)=>{const sid=id(req.body.student_id),cid=id(req.body.course_id);const student=await one("SELECT * FROM users WHERE id=$1 AND role='student' AND active=true",[sid]),course=await one('SELECT * FROM courses WHERE id=$1',[cid]);if(!student||!course)fail(400,'Invalid student or course');if(student.batch_id){const batch=await membership(student.batch_id);if(batch.semester!==course.semester||!await one('SELECT id FROM course_assignments WHERE course_id=$1 AND batch_id=$2',[cid,batch.id]))fail(400,'Batch assignment and matching semester required');}await db.query('INSERT INTO enrollments(student_id,course_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[sid,cid]);await audit(req,'student_enrolled',`${sid}:${cid}`);res.json({ok:true});});
+function isoDate(v){return v instanceof Date?v.toISOString().slice(0,10):String(v).slice(0,10);}
+async function records(user,selected,from,to){const sid=['student','parent'].includes(user.role)?(user.role==='parent'?user.child_id:user.id):selected;if(!sid)fail(400,'Select a student');if(['student','parent'].includes(user.role)&&selected&&selected!==sid)fail(403,'Cannot view another student');const student=await one(`SELECT ${fields} FROM users WHERE id=$1 AND role='student' AND active=true`,[sid]);if(!student)fail(404,'Student unavailable');const allowed=await visibleCourses(user);const enrolled=await rows('SELECT course_id FROM enrollments WHERE student_id=$1',[sid]);let courses=allowed.filter(c=>enrolled.some(e=>e.course_id===c.id));if(user.role==='staff'){const scoped=await rows('SELECT c.id FROM courses c JOIN enrollments e ON e.course_id=c.id JOIN users u ON u.id=e.student_id WHERE u.id=$1 AND '+scopeSql('$2'),[sid,user.id]);courses=courses.filter(c=>scoped.some(s=>s.id===c.id));}if(user.role==='staff'&&!courses.length)fail(403,'This student is not in your assigned courses');const result=[];let held=0,present=0;for(const c of courses){const m=await one('SELECT values_json FROM marks WHERE student_id=$1 AND course_id=$2',[sid,c.id]);const args=[sid,c.id];let sql='SELECT date,slot,present,start_time,end_time FROM attendance WHERE student_id=$1 AND course_id=$2';if(from){args.push(date(from));sql+=` AND date>=$${args.length}`;}if(to){args.push(date(to));sql+=` AND date<=$${args.length}`;}sql+=' ORDER BY date DESC,slot';const sessions=(await rows(sql,args)).map(s=>({...s,date:isoDate(s.date)}));const h=sessions.length,p=sessions.filter(s=>s.present).length;held+=h;present+=p;result.push({...c,marks:m?.values_json||{},attendance:{held:h,present:p,percentage:h?Math.round(p/h*10000)/100:null},sessions});}return {student,courses:result,attendance:{held,present,percentage:held?Math.round(present/held*10000)/100:null}};}
+api.get('/records',async(req,res)=>{if(req.query.from&&req.query.to&&date(req.query.from)>date(req.query.to))fail(400,'From date must precede to date');res.json(await records(req.user,req.query.studentId,req.query.from,req.query.to));});
+api.put('/marks',roles('staff'),async(req,res)=>{const sid=id(req.body.student_id),cid=id(req.body.course_id);await academicWrite(req,sid,cid,async(tx,c)=>{const result=markValues(c,req.body.marks);await tx.query('INSERT INTO marks(student_id,course_id,values_json) VALUES($1,$2,$3) ON CONFLICT(student_id,course_id) DO UPDATE SET values_json=EXCLUDED.values_json,updated_at=NOW()',[sid,cid,JSON.stringify(result)]);});await audit(req,'marks_updated',sid+':'+cid);res.json({ok:true});});
+api.post('/attendance',roles('staff'),async(req,res)=>{const b=req.body,sid=id(b.student_id),cid=id(b.course_id);await academicWrite(req,sid,cid,async tx=>{const {d,slot}=await attendanceInput(b,tx);await saveAttendance(sid,cid,d,slot,b.present,tx);});await audit(req,'attendance_updated',sid+':'+cid);res.json({ok:true});});
+api.get('/feedback',roles('student','staff','admin'),async(req,res)=>{let sql='SELECT f.id,c.name AS course_name,u.name AS student_name,f.rating,f.comment,f.created_at FROM feedback f JOIN courses c ON c.id=f.course_id JOIN users u ON u.id=f.student_id';const args=[];if(req.user.role==='student'){sql+=' WHERE f.student_id=$1';args.push(req.user.id);}if(req.user.role==='staff'){sql+=' WHERE EXISTS(SELECT 1 FROM enrollments e WHERE e.student_id=u.id AND e.course_id=c.id) AND '+scopeSql();args.push(req.user.id);}res.json(await rows(sql+' ORDER BY f.created_at DESC',args));});
+api.post('/feedback',roles('student'),async(req,res)=>{const b=req.body,cid=id(b.course_id);const c=await one('SELECT c.*,COALESCE((SELECT a.staff_id FROM course_assignments a JOIN users s ON s.batch_id=a.batch_id WHERE s.id=$2 AND a.course_id=c.id),CASE WHEN NOT EXISTS(SELECT 1 FROM course_assignments a WHERE a.course_id=c.id) THEN c.staff_id END) AS current_staff FROM courses c WHERE c.id=$1',[cid,req.user.id]);if(!c||!c.current_staff||!await one('SELECT student_id FROM enrollments WHERE student_id=$1 AND course_id=$2',[req.user.id,cid]))fail(403,'Select one of your enrolled courses');if(!Number.isInteger(b.rating)||b.rating<1||b.rating>5)fail(400,'Rating must be 1–5');await db.query('INSERT INTO feedback(id,student_id,course_id,staff_id,rating,comment) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(student_id,course_id) DO UPDATE SET staff_id=EXCLUDED.staff_id,rating=EXCLUDED.rating,comment=EXCLUDED.comment,created_at=NOW()',[randomUUID(),req.user.id,cid,c.current_staff,b.rating,text(b.comment,'feedback',2000)]);res.json({ok:true});});
+api.get('/timetable',async(req,res)=>res.json(await timetable(req.user)));
+
+// ── ENHANCED AI STUDY ASSISTANT ──────────────────────────────────────────────
+// Capabilities: attendance report, marks/results, study notes, YouTube links,
+//               free resources, campus notices, exam timetable
+// Guardrails:   refuses non-enrolled courses and non-academic questions
+api.post('/assistant',roles('student'),rateLimit({windowMs:60000,limit:5,standardHeaders:'draft-8',legacyHeaders:false}),async(req,res)=>{
+  const question=text(req.body.question,'question',2000);
+  const r=await records(req.user);
+  const campus=await campusContext(req.user);
+
+  // Build student context for AI
+  const enrolledNames=r.courses.map(c=>c.name);
+  const scoped=r.courses.slice(0,40).map(c=>({
+    course:c.name.slice(0,200),
+    code:c.code||'',
+    attendance:{
+      held:c.attendance.held,
+      present:c.attendance.present,
+      percentage:c.attendance.percentage,
+      status:c.attendance.percentage===null?'No records yet':
+             c.attendance.percentage>=75?'Good (above 75%)':'Below 75% — risk of detention'
+    },
+    assessments:c.components.map(p=>({
+      name:p.label.slice(0,80),
+      maximum:p.max,
+      score:c.marks[p.key]??null
+    }))
+  }));
+
+  if(process.env.AI_ENABLED==='true'){
+    if(req.body.consent!==true)fail(400,'Consent is required to send your academic data to Google Gemini');
+    const key=process.env.GEMINI_API_KEY;
+    const model=process.env.GEMINI_MODEL||'gemini-2.0-flash';
+    if(!key||!model||!/^[a-zA-Z0-9._-]+$/.test(model))fail(503,'AI assistant is not configured. Contact administration.');
+    let upstream;
+    const systemPrompt=`You are an academic study assistant for Student University. You have access to this student's real data: enrolled courses, attendance, and marks.
+
+STRICT RULES (follow exactly):
+1. ONLY answer questions about: the student's enrolled courses, attendance records, marks/results, exam timetable, campus notices/events, study notes for enrolled course topics, YouTube or free study resources for enrolled courses.
+2. If asked about a course the student is NOT enrolled in, reply: "I'm not supposed to answer questions about courses you're not enrolled in. I can help with: ${enrolledNames.join(', ')}."
+3. If asked non-academic questions (movies, sports, weather, relationships, etc.), reply: "I'm not supposed to answer these kinds of questions. I can only help with your academic studies, attendance, marks, and study resources."
+4. For attendance: show each course attendance % with present/held counts and risk status. Flag courses below 75%.
+5. For marks/results: show internal scores per component per course clearly. State "Final exam not yet held" for null final marks.
+6. For study notes: generate well-structured concise notes (headings, bullet points) on the requested topic, but ONLY for enrolled courses.
+7. For YouTube resources: suggest specific search queries like "search YouTube for: [topic] NPTEL lecture" or "search YouTube for: [topic] explained simply". Only for enrolled courses.
+8. For free study material: suggest NPTEL, MIT OpenCourseWare, Khan Academy, Coursera (free audit), GeeksforGeeks, or other reputable open resources. Only for enrolled courses.
+9. Never invent data. Never predict official results. Never claim to change grades.
+10. Keep responses helpful, structured, and academically appropriate.
+
+Student name: ${req.user.name}
+Enrolled courses: ${enrolledNames.join(', ')}`;
+
+    try{upstream=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent',{method:'POST',headers:{'x-goog-api-key':key,'Content-Type':'application/json'},signal:AbortSignal.timeout(30000),body:JSON.stringify({systemInstruction:{parts:[{text:systemPrompt}]},contents:[{role:'user',parts:[{text:JSON.stringify({question,myData:{courses:scoped,overallAttendance:r.attendance},campus:{notices:campus.notices,events:campus.events,examTimetable:campus.timetable}})}]}],generationConfig:{maxOutputTokens:1800}})});}catch{fail(502,'Study assistant did not respond. Please try again.');}
+    if(!upstream.ok)fail(502,'Study assistant unavailable. Please try again in a moment.');
+    let json;try{json=await upstream.json();}catch{fail(502,'Invalid response from study assistant.');}
+    const candidate=json.candidates?.[0];
+    const answer=candidate?.content?.parts?.filter(p=>!p.thought&&typeof p.text==='string').map(p=>p.text).join('\n').trim();
+    if(!answer||!['STOP','MAX_TOKENS'].includes(candidate.finishReason))fail(502,'Could not generate a response. Please rephrase your question.');
+    res.json({mode:'ai',provider:'gemini',answer});
+  }else{
+    // Rule-based fallback (when AI_ENABLED=false)
+    const q2=question.toLowerCase();
+    const lines=[];
+    lines.push(`Hello ${req.user.name}! Here is your academic summary:\n`);
+    if(/attendance|present|absent|percent/i.test(q2)){
+      lines.push('📅 ATTENDANCE REPORT:');
+      for(const c of r.courses){
+        const a=c.attendance;
+        const pct=a.percentage===null?'No records':a.percentage+'%';
+        const flag=a.percentage!==null&&a.percentage<75?' ⚠️ Below 75%':'';
+        lines.push(`• ${c.name}: ${a.present}/${a.held} classes — ${pct}${flag}`);
+        if(a.held&&a.percentage<75){const need=Math.ceil((.75*a.held-a.present)/.25);lines.push(`  → Need ${need} more consecutive classes to reach 75%.`);}
+      }
+      lines.push(`\nOverall: ${r.attendance.present}/${r.attendance.held} (${r.attendance.percentage??'N/A'}%)`);
+    }else if(/mark|result|score|internal|grade|ia|assessment/i.test(q2)){
+      lines.push('📝 MARKS SUMMARY (Internal):');
+      for(const c of r.courses){
+        lines.push(`\n${c.name}:`);
+        for(const p of c.components){const v=c.marks[p.key];lines.push(`  ${p.label}: ${v===null?'Not assessed':v+'/'+p.max}`);}
+        const assessed=c.components.filter(p=>c.marks[p.key]!==null);
+        const total=assessed.reduce((s,p)=>s+c.marks[p.key],0);
+        const max=assessed.reduce((s,p)=>s+p.max,0);
+        if(assessed.length)lines.push(`  Total internal so far: ${total}/${max}`);
+        lines.push(`  Final exam: Not yet held`);
+      }
+    }else if(/exam|timetable|schedule|when/i.test(q2)){
+      lines.push('📆 EXAM TIMETABLE:');
+      if(campus.timetable.length)campus.timetable.forEach(t=>lines.push(`• ${t.date} | ${t.time} | ${t.course} | ${t.exam_type} | Room: ${t.room}`));
+      else lines.push('No exam timetable available yet.');
+    }else if(/notice|circular|announce|update/i.test(q2)){
+      lines.push('📢 CAMPUS NOTICES:');
+      campus.notices.forEach(n=>lines.push(`• [${n.date}] ${n.title}\n  ${n.body.slice(0,200)}`));
+    }else if(/event/i.test(q2)){
+      lines.push('📆 CAMPUS EVENTS:');
+      campus.events.forEach(e=>lines.push(`• ${e.start_date}–${e.end_date}: ${e.title}\n  ${e.body.slice(0,200)}`));
+    }else{
+      lines.push('📚 YOUR ENROLLED COURSES:');
+      for(const c of r.courses)lines.push(`• ${c.name} (${c.code||''})`);
+      lines.push('\nYou can ask me about:');
+      lines.push('• My attendance report');
+      lines.push('• My marks and results');
+      lines.push('• Exam timetable and schedule');
+      lines.push('• Campus notices and events');
+      lines.push('\n💡 Enable the AI assistant for: study notes, YouTube links, free study resources, and intelligent Q&A.');
+      lines.push('Ask your administrator to enable AI_ENABLED=true with a Gemini API key.');
+    }
+    res.json({mode:'local',answer:lines.join('\n')});
+  }
+});
+
+api.use((req,res)=>res.status(404).json({error:'API route not found'}));
+const clientPath=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../client/dist/client/browser');
+app.use(express.static(clientPath,{maxAge:production?'1h':0}));
+app.get('/{*path}',(req,res)=>res.sendFile(path.join(clientPath,'index.html')));
+app.use((err,req,res,next)=>{if(err.code==='23503')return res.status(409).json({error:'Configuration is in use or a referenced record is invalid'});if(err.code==='22P02')return res.status(400).json({error:'Invalid value'});if(err.code==='23505')return res.status(409).json({error:'That value already exists'});if(err.type==='entity.parse.failed')return res.status(400).json({error:'Invalid JSON'});if(err.type==='entity.too.large')return res.status(413).json({error:'Request too large'});if(!err.status)console.error('Request failed:',err.message);res.status(err.status||500).json({error:err.status?err.message:'Server error; check server logs'});});
+export {app,records};
