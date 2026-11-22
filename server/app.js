@@ -179,6 +179,51 @@ Enrolled courses: ${enrolledNames.join(', ')}`;
   }
 });
 
+// ── Admin: bulk reset passwords + generate credentials file ──────────────────
+api.post('/admin/reset-credentials',roles('admin'),rateLimit({windowMs:60000,limit:2,standardHeaders:'draft-8',legacyHeaders:false}),async(req,res)=>{
+  const {writeFile}=await import('node:fs/promises');
+  const makePassword=(role,username)=>{
+    const prefix=role==='staff'?'Prof':'Stud';
+    const slug=username.slice(0,12);
+    return `${prefix}@${slug}26!`;
+  };
+  const allUsers=await rows(`SELECT ${fields} FROM users WHERE role IN ('staff','student','parent') AND active=true ORDER BY role,department,name`);
+  const lines=['='.repeat(80),'STUDENT UNIVERSITY — ALL USER CREDENTIALS',`Generated: ${new Date().toISOString()}`,'Live Site: https://student-university-portal.onrender.com','='.repeat(80),'','── ADMIN ──────────────────────────────────────────────────────────────────','  Username: administrator','  Password: (set via BOOTSTRAP_ADMIN_PASSWORD env var)',''];
+  lines.push('── STAFF ──────────────────────────────────────────────────────────────────');
+  const staff=allUsers.filter(u=>u.role==='staff');
+  lines.push(`Total staff: ${staff.length}`);lines.push('');
+  for(const u of staff){
+    const pwd=makePassword('staff',u.username);
+    await db.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2',[await hashPassword(pwd),u.id]);
+    lines.push(`  Name      : ${u.name}`);lines.push(`  Username  : ${u.username}`);lines.push(`  Department: ${u.department}`);lines.push(`  Semester  : ${u.semester}`);lines.push(`  Password  : ${pwd}`);lines.push('');
+  }
+  lines.push('── STUDENTS ────────────────────────────────────────────────────────────────');
+  const students=allUsers.filter(u=>u.role==='student');
+  lines.push(`Total students: ${students.length}`);lines.push('');
+  const byDept={};
+  for(const s of students){const d=s.department||'Unknown';if(!byDept[d])byDept[d]={};const bn=s.batch_name||s.batch_id||'No Batch';if(!byDept[d][bn])byDept[d][bn]=[];byDept[d][bn].push(s);}
+  for(const [dept,batches] of Object.entries(byDept).sort()){
+    lines.push(`  Department: ${dept}`);
+    for(const [bname,studs] of Object.entries(batches).sort()){
+      lines.push(`    Batch: ${bname}`);
+      lines.push(`    ${'Name'.padEnd(28)} | ${'Username'.padEnd(45)} | Password`);
+      lines.push(`    ${'-'.repeat(100)}`);
+      for(const s of studs){
+        const pwd=makePassword('student',s.username);
+        await db.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2',[await hashPassword(pwd),s.id]);
+        lines.push(`    ${(s.name||'').padEnd(28)} | ${(s.username||'').padEnd(45)} | ${pwd}`);
+      }
+      lines.push('');
+    }
+  }
+  lines.push('='.repeat(80));
+  const content=lines.join('\n');
+  await writeFile('ALL-CREDENTIALS.txt',content,'utf8');
+  res.setHeader('Content-Type','text/plain');
+  res.setHeader('Content-Disposition','attachment; filename="ALL-CREDENTIALS.txt"');
+  res.send(content);
+});
+
 // ── Admin: download credentials file ─────────────────────────────────────────
 api.get('/admin/credentials',roles('admin'),async(req,res)=>{
   try{
@@ -188,7 +233,7 @@ api.get('/admin/credentials',roles('admin'),async(req,res)=>{
     res.setHeader('Content-Disposition','attachment; filename="ALL-CREDENTIALS.txt"');
     res.send(creds);
   }catch(e){
-    res.status(404).json({error:'Credentials file not found. Run seed first.'});
+    res.status(404).json({error:'Credentials file not found. Run seed first or POST /api/admin/reset-credentials'});
   }
 });
 
