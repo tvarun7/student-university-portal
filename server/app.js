@@ -179,6 +179,19 @@ Enrolled courses: ${enrolledNames.join(', ')}`;
   }
 });
 
+// ── Admin: download credentials file ─────────────────────────────────────────
+api.get('/admin/credentials',roles('admin'),async(req,res)=>{
+  try{
+    const {readFile}=await import('node:fs/promises');
+    const creds=await readFile('ALL-CREDENTIALS.txt','utf8');
+    res.setHeader('Content-Type','text/plain');
+    res.setHeader('Content-Disposition','attachment; filename="ALL-CREDENTIALS.txt"');
+    res.send(creds);
+  }catch(e){
+    res.status(404).json({error:'Credentials file not found. Run seed first.'});
+  }
+});
+
 api.use((req,res)=>res.status(404).json({error:'API route not found'}));
 const clientPath=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../client/dist/client/browser');
 app.use(express.static(clientPath,{maxAge:production?'1h':0}));

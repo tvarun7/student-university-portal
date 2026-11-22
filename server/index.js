@@ -36,6 +36,12 @@ if(process.env.AUTO_SEED==='true'){
       const {default:seed}=await import('./seed.js');
       await seed();
       console.log('[seed] Seed complete!');
+      // Print credentials to console so they can be retrieved from Render logs
+      try{
+        const {readFile}=await import('node:fs/promises');
+        const creds=await readFile('ALL-CREDENTIALS.txt','utf8');
+        console.log('\n[credentials] ===== ALL-CREDENTIALS.TXT =====\n'+creds+'\n[credentials] ===== END CREDENTIALS =====');
+      }catch(e){console.warn('[seed] Could not print credentials file:',e.message);}
     }
   }catch(e){console.error('[seed] Error:',e.message);}
 }
